@@ -223,6 +223,8 @@ typedef struct VideoState {
     FrameQueue subpq;
     FrameQueue sampq;
 
+    FrameQueue filterQueue;
+
     Decoder auddec;
     Decoder viddec;
     Decoder subdec;
@@ -1736,7 +1738,7 @@ static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, double 
            av_get_picture_type_char(src_frame->pict_type), pts);
 #endif
 
-    if (!(vp = frame_queue_peek_writable(&is->pictq)))
+    if (!(vp = frame_queue_peek_writable(&is->filterQueue)))
         return -1;
 
     vp->sar = src_frame->sample_aspect_ratio;
@@ -1754,7 +1756,7 @@ static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, double 
     set_default_window_size(vp->width, vp->height, vp->sar);
 
     av_frame_move_ref(vp->frame, src_frame);
-    frame_queue_push(&is->pictq);
+    frame_queue_push(&is->filterQueue);
     return 0;
 }
 
@@ -3079,6 +3081,9 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
     if (frame_queue_init(&is->subpq, &is->subtitleq, SUBPICTURE_QUEUE_SIZE, 0) < 0)
         goto fail;
     if (frame_queue_init(&is->sampq, &is->audioq, SAMPLE_QUEUE_SIZE, 1) < 0)
+        goto fail;
+
+    if (frame_queue_init(&is->filterQueue, NULL, 200, 1) < 0)
         goto fail;
 
     if (packet_queue_init(&is->videoq) < 0 ||
