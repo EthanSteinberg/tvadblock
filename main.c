@@ -1047,6 +1047,9 @@ static void video_image_display(VideoState *is)
     SDL_RenderCopyEx(renderer, is->vid_texture, NULL, &rect, 0, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
     set_sdl_yuv_conversion_mode(NULL);
 
+
+    is->muted = vp->is_ad;
+
     if (vp->is_ad) {
         SDL_RenderCopy(renderer, is->ad_warning, NULL, NULL);
     }
