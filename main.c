@@ -315,8 +315,6 @@ typedef struct VideoState {
 
     SDL_cond *continue_read_thread;
     SDL_Thread *filter_tid;
-
-    unsigned char* logo_data;
 } VideoState;
 
 /* options specified by the user */
@@ -3096,7 +3094,8 @@ static void copy_frame(const Frame* read_frame, Frame* write_frame) {
     av_frame_move_ref(write_frame->frame, read_frame->frame);
 }
 
-const int NUM_BUFFER = 1;
+const int NUM_BUFFER = 30;
+const int RUN_EVERY = 5;
 
 typedef struct Heuristics {
     int is_black_frame;
@@ -3108,7 +3107,7 @@ static int filter_thread(void* data) {
 
     VideoState *is = (VideoState*) data;
 
-    Heuristics heuristics[NUM_BUFFER];
+    Heuristics heuristics[NUM_BUFFER / RUN_EVERY];
     Frame frame_buffer[NUM_BUFFER];
     int frame_to_write_next = 0;
 
@@ -3134,50 +3133,20 @@ static int filter_thread(void* data) {
             continue;
         }
 
-        uint8_t* y_data = read_frame->frame->data[0];
-        uint8_t* u_data = read_frame->frame->data[1];
-        uint8_t* v_data = read_frame->frame->data[2];
+        if (frame_to_write_next % RUN_EVERY == 0) {
+            uint8_t* y_data = read_frame->frame->data[0];
+            uint8_t* u_data = read_frame->frame->data[1];
+            uint8_t* v_data = read_frame->frame->data[2];
 
-        yuv420_rgb24_std(1280, 720, y_data, u_data, v_data, 1280, 1280/2,
-            rgbData, 1280 * 3, YCBCR_709);
+            yuv420_rgb24_std(1280, 720, y_data, u_data, v_data, 1280, 1280/2,
+                rgbData, 1280 * 3, YCBCR_709);
 
-        float score = helper(rgbData, foo);
-
-        uint8_t max_y = 0;
-
-        double difference = 0;
-
-        for (int y = 0; y < 720; y++) {
-            for (int x = 0; x < 1280; x++) {
-                int Y = y_data[y * 1280 + x] ;
-                int U = u_data[(y / 2) * (1280 / 2) + (x / 2)];
-                int V = v_data[(y / 2) * (1280 / 2) + (x / 2)];
-
-                int r = rgbData[1280 * 3 * y + x * 3 + 0];
-                int g = rgbData[1280 * 3 * y + x * 3 + 1];
-                int b = rgbData[1280 * 3 * y + x * 3 + 2];
-
-
-                int image_r = is->logo_data[1280 * 4 * y + x * 4 + 0];
-                int image_g = is->logo_data[1280 * 4 * y + x * 4 + 1];
-                int image_b = is->logo_data[1280 * 4 * y + x * 4 + 2];
-                int image_a = is->logo_data[1280 * 4 * y + x * 4 + 3];
-         
-                if (image_a == 255) {
-                    difference += (image_r - r) * (image_r - r);
-                    difference += (image_g - g) * (image_g - g);
-                    difference += (image_b - b) * (image_b - b);
-                }
-
-                max_y = fmax(max_y, Y);
-            }
+            float score = helper(rgbData, foo);
+            heuristics[frame_to_write_next / RUN_EVERY].has_probable_logo = score < 1000 / 5250.0;
         }
 
         copy_frame(read_frame, &frame_buffer[frame_to_write_next]);
         frame_queue_next(&is->filterQueue);
-
-        heuristics[frame_to_write_next].is_black_frame = max_y < 6;
-        heuristics[frame_to_write_next].has_probable_logo = score < 1000;
 
         frame_to_write_next = (frame_to_write_next + 1) % NUM_BUFFER;
 
@@ -3192,7 +3161,16 @@ static int filter_thread(void* data) {
 
             copy_frame(&frame_buffer[frame_to_write_next], write_frame);
 
-            write_frame->is_ad = !heuristics[frame_to_write_next].has_probable_logo;
+            int count = 0;
+            int total = NUM_BUFFER / RUN_EVERY;
+
+            for (int i = 0; i < NUM_BUFFER; i += RUN_EVERY) {
+                if (heuristics[i / RUN_EVERY].has_probable_logo) {
+                    count += 1;
+                }
+            }
+
+            write_frame->is_ad = count <= 0.5 * total;
 
             frame_queue_push(&is->pictq);
         }
@@ -3943,16 +3921,6 @@ int main(int argc, char **argv)
     SDL_Surface* surface = create_surface();
     SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
     is->ad_warning = texture;
-
-    int req_format = STBI_rgb_alpha;
-    int width, height, orig_format;
-    unsigned char* mask_data = stbi_load("./nbcMask.png", &width, &height, &orig_format, req_format);
-    if(mask_data == NULL) {
-      SDL_Log("Loading mask image failed: %s", stbi_failure_reason());
-      exit(1);
-    }
-
-    is->logo_data = mask_data;
 
     event_loop(is);
 

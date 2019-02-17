@@ -11,11 +11,15 @@ int i = 0;
 
 struct Data {
     cv::Mat nbc_mask;
+    cv::Mat other_mask;
+    cv::Mat other_mask2;
 };
 
 void* init_data() {
     Data* data = new Data;
     data->nbc_mask = cv::imread("nbcBetterMask.png", cv::IMREAD_UNCHANGED);
+    data->other_mask = cv::imread("nbcOtherMask.png", cv::IMREAD_UNCHANGED);
+    data->other_mask2 = cv::imread("nbcOther2Mask.png", cv::IMREAD_UNCHANGED);
 
     return (void*) data;
 }
@@ -52,6 +56,14 @@ float helper(unsigned char* rgb_data, void* info) {
     cv::adaptiveThreshold(grad, threshold_grad, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C, cv::THRESH_BINARY, 11, -3);
 
     float num_incorrect = 0;
+    float num = 0;
+
+    float num_incorrect_other = 0;
+    float num_other = 0;
+
+
+    float num_incorrect_other2 = 0;
+    float num_other2 = 0;
 
     for (int y = 0; y < 720; y++) {
         for (int x = 0; x < 1280; x++) {
@@ -59,20 +71,44 @@ float helper(unsigned char* rgb_data, void* info) {
             int value = data->nbc_mask.at<cv::Vec4b>(y,x)[0];
 
             int current_value = threshold_grad.at<unsigned char>(y, x);
+            if (a == 255) {
+                num += 1;
+                if (value != current_value) {
+                    num_incorrect += 1;
+                }
+            } 
 
-            if (a == 255 && value != current_value) {
-                num_incorrect += 1;
-                // printf("Fail %d %d %d\n", a, value, current_value);
-            }
+
+            int other_a = data->other_mask.at<cv::Vec4b>(y,x)[3];
+            int other_value = data->other_mask.at<cv::Vec4b>(y,x)[0];
+
+            if (other_a == 255) {
+                num_other += 1;
+                if (other_value != current_value) {
+                    num_incorrect_other += 1;
+                }
+            } 
+
+            int other2_a = data->other_mask2.at<cv::Vec4b>(y,x)[3];
+            int other2_value = data->other_mask2.at<cv::Vec4b>(y,x)[0];
+
+            if (other2_a == 255) {
+                num_other2 += 1;
+                if (other2_value != current_value) {
+                    num_incorrect_other2 += 1;
+                }
+            } 
         }
     }
 
-    // if (i % 100 == 0) {
-    //     printf("I am helping\n");
+    if (i % 100 == 0) {
+        printf("I am helping\n");
 
-    //     cv::imwrite("hope.png", threshold_grad );    
-    // }
+        cv::imwrite("hope.png", threshold_grad );    
+    }
 
-    return num_incorrect;
+    return std::min(
+        std::min(num_incorrect / num, num_incorrect_other / num_other),
+        num_incorrect_other2 / num_other2);
 
 }
