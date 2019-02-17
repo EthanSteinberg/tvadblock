@@ -28,6 +28,11 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
+#include "yuv_rgb.h"
+#include "opencv_helper.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #include "libavutil/avstring.h"
 #include "libavutil/eval.h"
@@ -163,6 +168,7 @@ typedef struct Frame {
     AVRational sar;
     int uploaded;
     int flip_v;
+    int is_ad;
 } Frame;
 
 typedef struct FrameQueue {
@@ -274,6 +280,9 @@ typedef struct VideoState {
     SDL_Texture *sub_texture;
     SDL_Texture *vid_texture;
 
+
+    SDL_Texture *ad_warning;
+
     int subtitle_stream;
     AVStream *subtitle_st;
     PacketQueue subtitleq;
@@ -305,6 +314,9 @@ typedef struct VideoState {
     int last_video_stream, last_audio_stream, last_subtitle_stream;
 
     SDL_cond *continue_read_thread;
+    SDL_Thread *filter_tid;
+
+    unsigned char* logo_data;
 } VideoState;
 
 /* options specified by the user */
@@ -964,8 +976,9 @@ static void set_sdl_yuv_conversion_mode(AVFrame *frame)
             mode = SDL_YUV_CONVERSION_JPEG;
         else if (frame->colorspace == AVCOL_SPC_BT709)
             mode = SDL_YUV_CONVERSION_BT709;
-        else if (frame->colorspace == AVCOL_SPC_BT470BG || frame->colorspace == AVCOL_SPC_SMPTE170M || frame->colorspace == AVCOL_SPC_SMPTE240M)
+        else if (frame->colorspace == AVCOL_SPC_BT470BG || frame->colorspace == AVCOL_SPC_SMPTE170M || frame->colorspace == AVCOL_SPC_SMPTE240M) {
             mode = SDL_YUV_CONVERSION_BT601;
+        }
     }
     SDL_SetYUVConversionMode(mode);
 #endif
@@ -1035,6 +1048,11 @@ static void video_image_display(VideoState *is)
     set_sdl_yuv_conversion_mode(vp->frame);
     SDL_RenderCopyEx(renderer, is->vid_texture, NULL, &rect, 0, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
     set_sdl_yuv_conversion_mode(NULL);
+
+    if (vp->is_ad) {
+        SDL_RenderCopy(renderer, is->ad_warning, NULL, NULL);
+    }
+
     if (sp) {
 #if USE_ONEPASS_SUBTITLE_RENDER
         SDL_RenderCopy(renderer, is->sub_texture, NULL, &rect);
@@ -1712,18 +1730,18 @@ display:
                 av_diff = get_master_clock(is) - get_clock(&is->vidclk);
             else if (is->audio_st)
                 av_diff = get_master_clock(is) - get_clock(&is->audclk);
-            av_log(NULL, AV_LOG_INFO,
-                   "%7.2f %s:%7.3f fd=%4d aq=%5dKB vq=%5dKB sq=%5dB f=%"PRId64"/%"PRId64"   \r",
-                   get_master_clock(is),
-                   (is->audio_st && is->video_st) ? "A-V" : (is->video_st ? "M-V" : (is->audio_st ? "M-A" : "   ")),
-                   av_diff,
-                   is->frame_drops_early + is->frame_drops_late,
-                   aqsize / 1024,
-                   vqsize / 1024,
-                   sqsize,
-                   is->video_st ? is->viddec.avctx->pts_correction_num_faulty_dts : 0,
-                   is->video_st ? is->viddec.avctx->pts_correction_num_faulty_pts : 0);
-            fflush(stdout);
+            // av_log(NULL, AV_LOG_INFO,
+            //        "%7.2f %s:%7.3f fd=%4d aq=%5dKB vq=%5dKB sq=%5dB f=%"PRId64"/%"PRId64"   \r",
+            //        get_master_clock(is),
+            //        (is->audio_st && is->video_st) ? "A-V" : (is->video_st ? "M-V" : (is->audio_st ? "M-A" : "   ")),
+            //        av_diff,
+            //        is->frame_drops_early + is->frame_drops_late,
+            //        aqsize / 1024,
+            //        vqsize / 1024,
+            //        sqsize,
+            //        is->video_st ? is->viddec.avctx->pts_correction_num_faulty_dts : 0,
+            //        is->video_st ? is->viddec.avctx->pts_correction_num_faulty_pts : 0);
+            // fflush(stdout);
             last_time = cur_time;
         }
     }
@@ -3061,6 +3079,126 @@ static int read_thread(void *arg)
     return 0;
 }
 
+static void copy_frame(const Frame* read_frame, Frame* write_frame) {
+    write_frame->width = read_frame->width;
+    write_frame->height = read_frame->height;
+    write_frame->format = read_frame->format;
+    write_frame->sar = read_frame->sar;
+    write_frame->uploaded = read_frame->uploaded;
+    write_frame->pts = read_frame->pts;
+
+    write_frame->duration = read_frame->duration;
+
+    write_frame->pos = read_frame->pos;
+
+    write_frame->serial = read_frame->serial;
+
+    av_frame_move_ref(write_frame->frame, read_frame->frame);
+}
+
+const int NUM_BUFFER = 1;
+
+typedef struct Heuristics {
+    int is_black_frame;
+    int has_probable_logo;
+} Heuristics;
+
+static int filter_thread(void* data) {
+    void* foo = init_data();
+
+    VideoState *is = (VideoState*) data;
+
+    Heuristics heuristics[NUM_BUFFER];
+    Frame frame_buffer[NUM_BUFFER];
+    int frame_to_write_next = 0;
+
+    int frames_needed_to_fill = NUM_BUFFER;
+
+    for (int i = 0; i < NUM_BUFFER; i++) {
+        if (!(frame_buffer[i].frame = av_frame_alloc())) {
+            return AVERROR(ENOMEM);
+        }
+    }
+
+    unsigned char* rgbData = malloc(1280 * 720 * 3);
+
+    while (1) {
+        Frame* read_frame = frame_queue_peek_readable(&is->filterQueue);
+
+        if (read_frame == NULL) {
+            continue;
+        }
+
+        if (read_frame->width != 1280 || read_frame->height != 720) {
+            printf("Bad image\n");
+            continue;
+        }
+
+        uint8_t* y_data = read_frame->frame->data[0];
+        uint8_t* u_data = read_frame->frame->data[1];
+        uint8_t* v_data = read_frame->frame->data[2];
+
+        yuv420_rgb24_std(1280, 720, y_data, u_data, v_data, 1280, 1280/2,
+            rgbData, 1280 * 3, YCBCR_709);
+
+        float score = helper(rgbData, foo);
+
+        uint8_t max_y = 0;
+
+        double difference = 0;
+
+        for (int y = 0; y < 720; y++) {
+            for (int x = 0; x < 1280; x++) {
+                int Y = y_data[y * 1280 + x] ;
+                int U = u_data[(y / 2) * (1280 / 2) + (x / 2)];
+                int V = v_data[(y / 2) * (1280 / 2) + (x / 2)];
+
+                int r = rgbData[1280 * 3 * y + x * 3 + 0];
+                int g = rgbData[1280 * 3 * y + x * 3 + 1];
+                int b = rgbData[1280 * 3 * y + x * 3 + 2];
+
+
+                int image_r = is->logo_data[1280 * 4 * y + x * 4 + 0];
+                int image_g = is->logo_data[1280 * 4 * y + x * 4 + 1];
+                int image_b = is->logo_data[1280 * 4 * y + x * 4 + 2];
+                int image_a = is->logo_data[1280 * 4 * y + x * 4 + 3];
+         
+                if (image_a == 255) {
+                    difference += (image_r - r) * (image_r - r);
+                    difference += (image_g - g) * (image_g - g);
+                    difference += (image_b - b) * (image_b - b);
+                }
+
+                max_y = fmax(max_y, Y);
+            }
+        }
+
+        copy_frame(read_frame, &frame_buffer[frame_to_write_next]);
+        frame_queue_next(&is->filterQueue);
+
+        heuristics[frame_to_write_next].is_black_frame = max_y < 6;
+        heuristics[frame_to_write_next].has_probable_logo = score < 1000;
+
+        frame_to_write_next = (frame_to_write_next + 1) % NUM_BUFFER;
+
+        if (frames_needed_to_fill > 0) {
+            frames_needed_to_fill--;
+        } else {
+            Frame* write_frame = frame_queue_peek_writable(&is->pictq);
+
+            if (write_frame == NULL) {
+                printf("Got null write frame?\n");
+            }
+
+            copy_frame(&frame_buffer[frame_to_write_next], write_frame);
+
+            write_frame->is_ad = !heuristics[frame_to_write_next].has_probable_logo;
+
+            frame_queue_push(&is->pictq);
+        }
+    }
+}
+
 static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
 {
     VideoState *is;
@@ -3083,7 +3221,7 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
     if (frame_queue_init(&is->sampq, &is->audioq, SAMPLE_QUEUE_SIZE, 1) < 0)
         goto fail;
 
-    if (frame_queue_init(&is->filterQueue, NULL, 200, 1) < 0)
+    if (frame_queue_init(&is->filterQueue, &is->videoq, VIDEO_PICTURE_QUEUE_SIZE, 1) < 0)
         goto fail;
 
     if (packet_queue_init(&is->videoq) < 0 ||
@@ -3116,6 +3254,7 @@ fail:
         stream_close(is);
         return NULL;
     }
+    is->filter_tid = SDL_CreateThread(filter_thread, "filter_thread", is);
     return is;
 }
 
@@ -3664,6 +3803,50 @@ void show_help_default(const char *opt, const char *arg)
            );
 }
 
+SDL_Surface* create_surface() {
+    // This example shows how to create a SDL_Surface* with the data loaded from an image
+    // file with the stb_image.h library (https://github.com/nothings/stb/)
+
+    // the color format you request stb_image to output,
+    // use STBI_rgb if you don't want/need the alpha channel
+    int req_format = STBI_rgb_alpha;
+    int width, height, orig_format;
+    unsigned char* data = stbi_load("./adWarning.png", &width, &height, &orig_format, req_format);
+    if(data == NULL) {
+      SDL_Log("Loading image failed: %s", stbi_failure_reason());
+      exit(1);
+    }
+
+    // Set up the pixel format color masks for RGB(A) byte arrays.
+    // Only STBI_rgb (3) and STBI_rgb_alpha (4) are supported here!
+    Uint32 rmask, gmask, bmask, amask;
+
+    rmask = 0x000000ff;
+    gmask = 0x0000ff00;
+    bmask = 0x00ff0000;
+    amask = (req_format == STBI_rgb) ? 0 : 0xff000000;
+
+    int depth, pitch;
+    if (req_format == STBI_rgb) {
+      depth = 24;
+      pitch = 3*width; // 3 bytes per pixel * pixels per row
+    } else { // STBI_rgb_alpha (RGBA)
+      depth = 32;
+      pitch = 4*width;
+    }
+
+    SDL_Surface* surf = SDL_CreateRGBSurfaceFrom((void*)data, width, height, depth, pitch,
+                                                 rmask, gmask, bmask, amask);
+
+    if (surf == NULL) {
+      SDL_Log("Creating surface failed: %s", SDL_GetError());
+      stbi_image_free(data);
+      exit(1);
+    }
+
+    return surf;
+}
+
 /* Called from the main */
 int main(int argc, char **argv)
 {
@@ -3689,6 +3872,8 @@ int main(int argc, char **argv)
     show_banner(argc, argv, options);
 
     parse_options(NULL, argc, argv, options, opt_input_file);
+
+    input_filename = "rtp://@127.0.0.1:4242";
 
     if (!input_filename) {
         show_usage();
@@ -3754,6 +3939,20 @@ int main(int argc, char **argv)
         av_log(NULL, AV_LOG_FATAL, "Failed to initialize VideoState!\n");
         do_exit(NULL);
     }
+
+    SDL_Surface* surface = create_surface();
+    SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
+    is->ad_warning = texture;
+
+    int req_format = STBI_rgb_alpha;
+    int width, height, orig_format;
+    unsigned char* mask_data = stbi_load("./nbcMask.png", &width, &height, &orig_format, req_format);
+    if(mask_data == NULL) {
+      SDL_Log("Loading mask image failed: %s", stbi_failure_reason());
+      exit(1);
+    }
+
+    is->logo_data = mask_data;
 
     event_loop(is);
 
